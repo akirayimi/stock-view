@@ -7,18 +7,34 @@ using System.Text.Json.Serialization;
 namespace StockTray;
 
 // ─────────────────────────────────────────────
-// 日志服务（写入 exe 同目录下 stocktray.log）
+// 日志服务（写入 ~/.stockview/log/ 目录下）
 // ─────────────────────────────────────────────
 internal static class Logger
 {
-    private static readonly string LogPath =
-        Path.Combine(AppContext.BaseDirectory, "stocktray.log");
+    private static readonly string LogDir =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".stockview", "log");
+
+    private static readonly string LogPath = Path.Combine(LogDir, "stocktray.log");
 
     private static readonly object LockObj = new();
     private const long MaxLogSize = 2 * 1024 * 1024; // 2MB 自动滚动
 
     // 日志开关（默认启用）
     public static bool Enabled { get; set; } = true;
+
+    static Logger()
+    {
+        // 确保日志目录存在
+        try
+        {
+            if (!Directory.Exists(LogDir))
+                Directory.CreateDirectory(LogDir);
+        }
+        catch
+        {
+            // 创建目录失败不崩溃
+        }
+    }
 
     public static void Info(string message) => Write("INFO", message);
     public static void Warn(string message) => Write("WARN", message);
@@ -39,9 +55,7 @@ internal static class Logger
                 // 超过 2MB 时滚动存档
                 if (File.Exists(LogPath) && new FileInfo(LogPath).Length > MaxLogSize)
                 {
-                    var archivePath = Path.Combine(
-                        AppContext.BaseDirectory,
-                        $"stocktray_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+                    var archivePath = Path.Combine(LogDir, $"stocktray_{DateTime.Now:yyyyMMdd_HHmmss}.log");
                     File.Move(LogPath, archivePath);
                 }
 
@@ -80,6 +94,9 @@ internal sealed class AppConfig
 
     [JsonPropertyName("logEnabled")]
     public bool LogEnabled { get; set; } = true;  // 默认启用日志
+
+    [JsonPropertyName("stockNames")]
+    public Dictionary<string, string> StockNames { get; set; } = new();  // 股票代码 → 名称映射
 }
 
 // ─────────────────────────────────────────────
@@ -99,13 +116,29 @@ internal sealed class StockSnapshot
 // ─────────────────────────────────────────────
 internal sealed class ConfigService
 {
-    private static readonly string ConfigPath =
-        Path.Combine(AppContext.BaseDirectory, "config.json");
+    private static readonly string ConfigDir =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".stockview");
+
+    private static readonly string ConfigPath = Path.Combine(ConfigDir, "config.json");
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = true
     };
+
+    static ConfigService()
+    {
+        // 确保配置目录存在
+        try
+        {
+            if (!Directory.Exists(ConfigDir))
+                Directory.CreateDirectory(ConfigDir);
+        }
+        catch
+        {
+            // 创建目录失败不崩溃
+        }
+    }
 
     public AppConfig Load()
     {
@@ -679,6 +712,15 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
 
         if (snap.IsValid)
         {
+            // 更新股票名称并持久化
+            if (!string.IsNullOrWhiteSpace(snap.Name) &&
+                (!_config.StockNames.TryGetValue(snap.Code, out var cachedName) || cachedName != snap.Name))
+            {
+                _config.StockNames[snap.Code] = snap.Name;
+                _cfgSvc.Save(_config);
+                Logger.Info($"股票名称更新并保存 | {snap.Code} → {snap.Name}");
+            }
+
             // 非交易日（数据无效时间段），清空历史
             var tradeDate = GetCurrentTradeDate();
             if (_priceHistory.Count == 0 || !IsSameTradingDay(tradeDate))
@@ -795,15 +837,71 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private void RefreshSwitchMenu()
     {
         _menuSwitch.DropDownItems.Clear();
+
+        // 如果没有股票，显示提示项
+        if (_config.Stocks.Count == 0)
+        {
+            var emptyItem = new ToolStripMenuItem("（暂无股票）")
+            {
+                Enabled = false
+            };
+            _menuSwitch.DropDownItems.Add(emptyItem);
+            return;
+        }
+
         foreach (var code in _config.Stocks)
         {
-            var item = new ToolStripMenuItem(code.ToUpper())
+            // 从配置读取名称
+            var displayText = _config.StockNames.TryGetValue(code, out var name)
+                ? $"{name} ({code.ToUpper()})"
+                : code.ToUpper();
+
+            var item = new ToolStripMenuItem(displayText)
             {
-                Checked = code == _config.CurrentStock
+                Checked = code == _config.CurrentStock,
+                Tag = code  // 保存原始代码
             };
             var captured = code;
             item.Click += (_, _) => SwitchStock(captured);
             _menuSwitch.DropDownItems.Add(item);
+
+            // 如果配置中没有名称，异步获取并保存
+            if (!_config.StockNames.ContainsKey(code))
+            {
+                _ = UpdateMenuItemNameAsync(item, code);
+            }
+        }
+    }
+
+    private async Task UpdateMenuItemNameAsync(ToolStripMenuItem item, string code)
+    {
+        try
+        {
+            var snap = await _dataSvc.FetchAsync(code);
+            if (snap.IsValid && !string.IsNullOrWhiteSpace(snap.Name))
+            {
+                // 更新配置并保存
+                _config.StockNames[code] = snap.Name;
+                _cfgSvc.Save(_config);
+                Logger.Info($"股票名称异步获取并保存 | {code} → {snap.Name}");
+
+                // 在 UI 线程更新菜单项文本
+                if (_contextMenu.InvokeRequired)
+                {
+                    _contextMenu.Invoke(() =>
+                    {
+                        item.Text = $"{snap.Name} ({code.ToUpper()})";
+                    });
+                }
+                else
+                {
+                    item.Text = $"{snap.Name} ({code.ToUpper()})";
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"异步获取股票名称失败 | 股票代码: {code} | {ex.Message}");
         }
     }
 
