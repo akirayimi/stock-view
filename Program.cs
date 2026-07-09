@@ -629,6 +629,10 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private readonly ToolStripMenuItem  _menuSwitch;
     private readonly ToolStripMenuItem  _menuLog;  // 日志开关菜单项
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly System.Windows.Forms.Timer _menuRefreshTimer;  // 菜单刷新定时器（30分钟）
+
+    // ── 菜单数据缓存 ──────────────────────────
+    private readonly Dictionary<string, StockSnapshot> _menuStockCache = new();  // 菜单显示用的股票快照缓存
 
     // ── 常量 ──────────────────────────────────
     private const int TradeIntervalMs    = 5_000;   // 盘中 5s
@@ -656,6 +660,9 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add("退出", null, (_, _) => ExitApp());
 
+        // 菜单打开时刷新列表
+        _contextMenu.Opening += (_, _) => RefreshSwitchMenu();
+
         // ── 托盘图标 ──────────────────────────
         _notifyIcon = new NotifyIcon
         {
@@ -668,7 +675,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         // 初始图标（灰色错误态）
         UpdateTrayIcon(null);
 
-        // ── 定时器 ────────────────────────────
+        // ── 主定时器 ──────────────────────────
         _timer = new System.Windows.Forms.Timer
         {
             Interval = TradeIntervalMs
@@ -676,11 +683,22 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         _timer.Tick += async (_, _) => await TickAsync();
         _timer.Start();
 
+        // ── 菜单刷新定时器（30分钟） ───────────
+        _menuRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 30 * 60 * 1000  // 30分钟
+        };
+        _menuRefreshTimer.Tick += async (_, _) => await RefreshAllStocksAsync();
+        _menuRefreshTimer.Start();
+
         RefreshSwitchMenu();
 
         // 首次立即拉取
         Logger.Info("首次拉取行情");
         _ = TickAsync();
+
+        // 首次异步刷新所有股票状态
+        _ = RefreshAllStocksAsync();
     }
 
     // ── 交易时间判断 ───────────────────────────
@@ -852,56 +870,134 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         foreach (var code in _config.Stocks)
         {
             // 从配置读取名称
-            var displayText = _config.StockNames.TryGetValue(code, out var name)
-                ? $"{name} ({code.ToUpper()})"
-                : code.ToUpper();
+            var stockName = _config.StockNames.TryGetValue(code, out var name) ? name : code.ToUpper();
+
+            // 从缓存读取实时数据
+            string displayText;
+            Color textColor = Color.White;
+
+            if (_menuStockCache.TryGetValue(code, out var snap) && snap.IsValid)
+            {
+                var pctChange = snap.BasePrice > 0
+                    ? (snap.CurrentPrice - snap.BasePrice) / snap.BasePrice * 100.0
+                    : 0.0;
+                var sign = pctChange >= 0 ? "+" : string.Empty;
+
+                // 格式：贵州茅台 (SH600519)  1701.50  +0.80%
+                displayText = $"{stockName} ({code.ToUpper()})  {snap.CurrentPrice:F2}  {sign}{pctChange:F2}%";
+                textColor = snap.CurrentPrice >= snap.BasePrice ? Color.Red : Color.LimeGreen;
+            }
+            else
+            {
+                // 无缓存数据，仅显示名称
+                displayText = $"{stockName} ({code.ToUpper()})";
+            }
 
             var item = new ToolStripMenuItem(displayText)
             {
                 Checked = code == _config.CurrentStock,
-                Tag = code  // 保存原始代码
+                ForeColor = textColor,
+                Tag = code
             };
+
             var captured = code;
             item.Click += (_, _) => SwitchStock(captured);
-            _menuSwitch.DropDownItems.Add(item);
 
-            // 如果配置中没有名称，异步获取并保存
-            if (!_config.StockNames.ContainsKey(code))
+            // 右键删除功能
+            item.MouseUp += (sender, e) =>
             {
-                _ = UpdateMenuItemNameAsync(item, code);
-            }
+                if (e.Button == MouseButtons.Right && sender is ToolStripMenuItem menuItem)
+                {
+                    var targetCode = menuItem.Tag as string;
+                    if (!string.IsNullOrEmpty(targetCode))
+                    {
+                        DeleteStock(targetCode);
+                    }
+                }
+            };
+
+            _menuSwitch.DropDownItems.Add(item);
         }
     }
 
-    private async Task UpdateMenuItemNameAsync(ToolStripMenuItem item, string code)
+    // ── 后台刷新所有股票状态（30分钟一次） ─────
+    private async Task RefreshAllStocksAsync()
     {
-        try
+        if (_config.Stocks.Count == 0)
         {
-            var snap = await _dataSvc.FetchAsync(code);
-            if (snap.IsValid && !string.IsNullOrWhiteSpace(snap.Name))
-            {
-                // 更新配置并保存
-                _config.StockNames[code] = snap.Name;
-                _cfgSvc.Save(_config);
-                Logger.Info($"股票名称异步获取并保存 | {code} → {snap.Name}");
+            Logger.Info("股票列表为空，跳过菜单刷新");
+            return;
+        }
 
-                // 在 UI 线程更新菜单项文本
-                if (_contextMenu.InvokeRequired)
+        Logger.Info($"开始后台刷新所有股票状态 | 总数: {_config.Stocks.Count}");
+
+        foreach (var code in _config.Stocks)
+        {
+            try
+            {
+                var snap = await _dataSvc.FetchAsync(code);
+
+                if (snap.IsValid)
                 {
-                    _contextMenu.Invoke(() =>
+                    _menuStockCache[code] = snap;
+
+                    // 更新名称缓存
+                    if (!string.IsNullOrWhiteSpace(snap.Name) &&
+                        (!_config.StockNames.TryGetValue(code, out var cachedName) || cachedName != snap.Name))
                     {
-                        item.Text = $"{snap.Name} ({code.ToUpper()})";
-                    });
-                }
-                else
-                {
-                    item.Text = $"{snap.Name} ({code.ToUpper()})";
+                        _config.StockNames[code] = snap.Name;
+                        Logger.Info($"股票名称更新 | {code} → {snap.Name}");
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                Logger.Warn($"刷新股票失败 | {code} | {ex.Message}");
+            }
+
+            // 每只股票请求间隔 3 秒，防止被封
+            await Task.Delay(3000);
         }
-        catch (Exception ex)
+
+        // 批量保存名称更新
+        _cfgSvc.Save(_config);
+        Logger.Info($"后台刷新完成 | 缓存股票数: {_menuStockCache.Count}");
+    }
+
+    // ── 删除股票 ───────────────────────────────
+    private void DeleteStock(string code)
+    {
+        var stockName = _config.StockNames.TryGetValue(code, out var name) ? name : code.ToUpper();
+
+        var result = MessageBox.Show(
+            $"确定要删除股票 {stockName} ({code.ToUpper()}) 吗？",
+            "删除确认",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (result != DialogResult.Yes) return;
+
+        Logger.Info($"用户删除股票 | {code}");
+
+        _config.Stocks.Remove(code);
+        _config.StockNames.Remove(code);
+        _menuStockCache.Remove(code);
+
+        // 如果删除的是当前股票，切换到第一个
+        if (_config.CurrentStock == code)
         {
-            Logger.Warn($"异步获取股票名称失败 | 股票代码: {code} | {ex.Message}");
+            _config.CurrentStock = _config.Stocks.Count > 0 ? _config.Stocks[0] : string.Empty;
+            _priceHistory.Clear();
+            _lastTradeDate = string.Empty;
+        }
+
+        _cfgSvc.Save(_config);
+        RefreshSwitchMenu();
+
+        // 如果删除后当前股票变了，立即拉取
+        if (_config.CurrentStock != code)
+        {
+            _ = TickAsync();
         }
     }
 
@@ -948,6 +1044,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         if (disposing)
         {
             _timer.Dispose();
+            _menuRefreshTimer.Dispose();
             _notifyIcon.Dispose();
             _contextMenu.Dispose();
             _dataSvc.Dispose();
