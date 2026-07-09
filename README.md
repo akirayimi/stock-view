@@ -22,6 +22,7 @@
 - **右键单击**：打开上下文菜单
   - 添加股票代码
   - 切换展示股票（多股票列表切换）
+  - **输出运行日志**（✓ 启用 / 禁用）
   - 退出程序
 
 ### 💾 数据持久化
@@ -38,7 +39,33 @@
   - `System.Windows.Forms.NotifyIcon` - 托盘图标
   - `System.Drawing` (GDI+) - 图形绘制
   - `System.Text.Json` - 配置持久化
+  - `System.Text.Encoding.CodePages` - GB2312 编码支持
   - Win32 API `DestroyIcon` - 非托管资源管理
+
+---
+
+## 📝 日志功能
+
+### 控制日志输出
+- **右键菜单** → **输出运行日志**（勾选启用，取消禁用）
+- 设置会自动保存到 `config.json`，下次启动自动恢复
+- **建议**：排查问题时启用日志；日常使用可禁用以减少磁盘写入
+
+### 自动记录运行日志
+程序会在 **exe 同目录下** 自动生成 `stocktray.log` 日志文件，记录以下信息：
+
+- **启动 / 退出**：进程 PID、操作系统版本、程序目录
+- **HTTP 请求**：请求 URL、响应长度、响应内容（前 200 字符）
+- **数据解析**：字段数量、价格解析结果、错误原因
+- **配置操作**：股票添加、切换、配置文件读写
+- **异常捕获**：网络超时、解析失败、未处理异常（含完整堆栈）
+
+### 日志自动滚动
+- 当 `stocktray.log` 超过 **2MB** 时，自动重命名为 `stocktray_20260709_161500.log`
+- 重新创建空白日志文件继续写入，防止日志文件过大
+
+### 故障排查
+遇到"数据获取失败"时，启用日志后重启程序，打开 `stocktray.log` 查看最后的 `[ERROR]` 日志行，定位具体失败原因。
 
 ---
 
@@ -122,12 +149,14 @@ dotnet publish `
     "sh600519",
     "sz000002"
   ],
-  "currentStock": "sh600519"
+  "currentStock": "sh600519",
+  "logEnabled": true
 }
 ```
 
 - `stocks`：历史添加过的所有股票代码列表
 - `currentStock`：当前正在监控的股票代码
+- `logEnabled`：日志开关（`true` 启用，`false` 禁用）
 
 > **注意**：直接编辑此文件需确保 JSON 格式正确，否则程序会忽略并重置为空配置。
 
@@ -178,11 +207,26 @@ Pixel_Y = Padding + height × (1 - (P_current - P_min) / (P_max - P_min))
 ## 🐛 故障排查
 
 ### 托盘图标显示灰色 "X"
-- **原因**：网络异常、股票代码错误、接口被限流
+- **原因**：网络异常、股票代码错误、接口被限流、字符编码解析失败
 - **解决**：
   1. 检查网络连接
   2. 确认股票代码格式正确（如 `sh600519`）
-  3. 等待程序自动重试（非交易时间会降低请求频率）
+  3. 查看同目录下 `stocktray.log` 文件，搜索最后的 `[ERROR]` 行定位具体原因
+  4. 等待程序自动重试（非交易时间会降低请求频率）
+
+### 常见错误码解读
+
+**`InvalidOperationException: The character set provided in ContentType is invalid`**  
+- **原因**：新浪接口返回 GB2312 编码，.NET 默认不支持
+- **状态**：已修复（v1.1.0+），通过 `System.Text.Encoding.CodePages` 包支持 GB2312
+
+**`响应内容为空 | 股票代码: xxxxx`**  
+- **原因**：股票代码不存在或格式错误
+- **解决**：检查代码格式（上海 `sh` + 6 位，深圳 `sz` + 6 位）
+
+**`TaskCanceledException: The request was canceled due to the configured HttpClient.Timeout`**  
+- **原因**：网络超时（8 秒未响应）
+- **解决**：检查网络连接，程序会自动重试
 
 ### 程序无法启动
 - **原因**：目标机器未安装 .NET 8.0 运行时

@@ -17,6 +17,9 @@ internal static class Logger
     private static readonly object LockObj = new();
     private const long MaxLogSize = 2 * 1024 * 1024; // 2MB 自动滚动
 
+    // 日志开关（默认启用）
+    public static bool Enabled { get; set; } = true;
+
     public static void Info(string message) => Write("INFO", message);
     public static void Warn(string message) => Write("WARN", message);
     public static void Error(string message, Exception? ex = null)
@@ -27,6 +30,8 @@ internal static class Logger
 
     private static void Write(string level, string message)
     {
+        if (!Enabled) return;  // 日志已禁用，直接返回
+
         try
         {
             lock (LockObj)
@@ -72,6 +77,9 @@ internal sealed class AppConfig
 
     [JsonPropertyName("currentStock")]
     public string CurrentStock { get; set; } = string.Empty;
+
+    [JsonPropertyName("logEnabled")]
+    public bool LogEnabled { get; set; } = true;  // 默认启用日志
 }
 
 // ─────────────────────────────────────────────
@@ -110,7 +118,11 @@ internal sealed class ConfigService
             }
             var json = File.ReadAllText(ConfigPath, Encoding.UTF8);
             var cfg = JsonSerializer.Deserialize<AppConfig>(json, JsonOpts) ?? new AppConfig();
-            Logger.Info($"配置加载成功 | 股票数: {cfg.Stocks.Count} | 当前股票: {cfg.CurrentStock}");
+
+            // 同步日志开关状态到 Logger
+            Logger.Enabled = cfg.LogEnabled;
+
+            Logger.Info($"配置加载成功 | 股票数: {cfg.Stocks.Count} | 当前股票: {cfg.CurrentStock} | 日志: {(cfg.LogEnabled ? "启用" : "禁用")}");
             return cfg;
         }
         catch (Exception ex)
@@ -147,6 +159,9 @@ internal sealed class StockDataService : IDisposable
 
     static StockDataService()
     {
+        // 注册 GB2312/GBK 编码提供程序（.NET Core 默认不包含）
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
         Http.DefaultRequestHeaders.Add(
             "Referer", "https://finance.sina.com.cn");
         Http.DefaultRequestHeaders.Add(
@@ -168,7 +183,10 @@ internal sealed class StockDataService : IDisposable
             var url = $"http://hq.sinajs.cn/list={code}";
             Logger.Info($"开始拉取行情 | 股票代码: {code} | URL: {url}");
 
-            var raw = await Http.GetStringAsync(url).ConfigureAwait(false);
+            // 使用 GetByteArrayAsync + GB2312 解码，避免 ContentType charset 无效异常
+            var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+            var raw = Encoding.GetEncoding("GB2312").GetString(bytes);
+
             Logger.Info($"HTTP 响应成功 | 股票代码: {code} | 响应长度: {raw.Length} 字符");
             Logger.Info($"HTTP 响应内容 | {raw.Substring(0, Math.Min(200, raw.Length))}");
 
@@ -443,6 +461,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private readonly NotifyIcon         _notifyIcon;
     private readonly ContextMenuStrip   _contextMenu;
     private readonly ToolStripMenuItem  _menuSwitch;
+    private readonly ToolStripMenuItem  _menuLog;  // 日志开关菜单项
     private readonly System.Windows.Forms.Timer _timer;
 
     // ── 常量 ──────────────────────────────────
@@ -456,10 +475,18 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
 
         // ── 上下文菜单 ────────────────────────
         _menuSwitch = new ToolStripMenuItem("切换展示股票");
+        _menuLog = new ToolStripMenuItem("输出运行日志")
+        {
+            Checked = _config.LogEnabled,
+            CheckOnClick = true
+        };
+        _menuLog.Click += OnToggleLog;
 
         _contextMenu = new ContextMenuStrip();
         _contextMenu.Items.Add("添加股票代码", null, OnAddStock);
         _contextMenu.Items.Add(_menuSwitch);
+        _contextMenu.Items.Add(new ToolStripSeparator());
+        _contextMenu.Items.Add(_menuLog);
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add("退出", null, (_, _) => ExitApp());
 
@@ -652,6 +679,18 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
 
         RefreshSwitchMenu();
         _ = TickAsync();
+    }
+
+    // ── 日志开关切换 ───────────────────────────
+    private void OnToggleLog(object? sender, EventArgs e)
+    {
+        _config.LogEnabled = _menuLog.Checked;
+        Logger.Enabled = _config.LogEnabled;
+
+        // 必须先更新 Logger.Enabled，再调用 Save（否则 Save 内的日志不会输出）
+        Logger.Info($"用户切换日志状态 | 新状态: {(_config.LogEnabled ? "启用" : "禁用")}");
+
+        _cfgSvc.Save(_config);
     }
 
     // ── 退出 ───────────────────────────────────
