@@ -7,6 +7,52 @@ using System.Text.Json.Serialization;
 namespace StockTray;
 
 // ─────────────────────────────────────────────
+// 日志服务（写入 exe 同目录下 stocktray.log）
+// ─────────────────────────────────────────────
+internal static class Logger
+{
+    private static readonly string LogPath =
+        Path.Combine(AppContext.BaseDirectory, "stocktray.log");
+
+    private static readonly object LockObj = new();
+    private const long MaxLogSize = 2 * 1024 * 1024; // 2MB 自动滚动
+
+    public static void Info(string message) => Write("INFO", message);
+    public static void Warn(string message) => Write("WARN", message);
+    public static void Error(string message, Exception? ex = null)
+    {
+        var msg = ex == null ? message : $"{message} | Exception: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}";
+        Write("ERROR", msg);
+    }
+
+    private static void Write(string level, string message)
+    {
+        try
+        {
+            lock (LockObj)
+            {
+                // 超过 2MB 时滚动存档
+                if (File.Exists(LogPath) && new FileInfo(LogPath).Length > MaxLogSize)
+                {
+                    var archivePath = Path.Combine(
+                        AppContext.BaseDirectory,
+                        $"stocktray_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+                    File.Move(LogPath, archivePath);
+                }
+
+                var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                var line = $"[{timestamp}] [{level}] {message}\n";
+                File.AppendAllText(LogPath, line, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+            // 日志写入失败不崩溃
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
 // Win32 互操作：安全释放 HICON 非托管句柄
 // ─────────────────────────────────────────────
 internal static class NativeMethods
@@ -57,12 +103,19 @@ internal sealed class ConfigService
     {
         try
         {
-            if (!File.Exists(ConfigPath)) return new AppConfig();
+            if (!File.Exists(ConfigPath))
+            {
+                Logger.Info("配置文件不存在，使用空配置");
+                return new AppConfig();
+            }
             var json = File.ReadAllText(ConfigPath, Encoding.UTF8);
-            return JsonSerializer.Deserialize<AppConfig>(json, JsonOpts) ?? new AppConfig();
+            var cfg = JsonSerializer.Deserialize<AppConfig>(json, JsonOpts) ?? new AppConfig();
+            Logger.Info($"配置加载成功 | 股票数: {cfg.Stocks.Count} | 当前股票: {cfg.CurrentStock}");
+            return cfg;
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.Error("配置加载失败", ex);
             return new AppConfig();
         }
     }
@@ -73,10 +126,11 @@ internal sealed class ConfigService
         {
             var json = JsonSerializer.Serialize(config, JsonOpts);
             File.WriteAllText(ConfigPath, json, Encoding.UTF8);
+            Logger.Info($"配置保存成功 | 当前股票: {config.CurrentStock}");
         }
-        catch
+        catch (Exception ex)
         {
-            // 保存失败不崩溃
+            Logger.Error("配置保存失败", ex);
         }
     }
 }
@@ -104,16 +158,25 @@ internal sealed class StockDataService : IDisposable
     public async Task<StockSnapshot> FetchAsync(string code)
     {
         if (string.IsNullOrWhiteSpace(code))
+        {
+            Logger.Warn("股票代码为空，无法拉取");
             return Invalid(code);
+        }
 
         try
         {
             var url = $"http://hq.sinajs.cn/list={code}";
+            Logger.Info($"开始拉取行情 | 股票代码: {code} | URL: {url}");
+
             var raw = await Http.GetStringAsync(url).ConfigureAwait(false);
+            Logger.Info($"HTTP 响应成功 | 股票代码: {code} | 响应长度: {raw.Length} 字符");
+            Logger.Info($"HTTP 响应内容 | {raw.Substring(0, Math.Min(200, raw.Length))}");
+
             return Parse(code, raw);
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.Error($"拉取行情失败 | 股票代码: {code}", ex);
             return Invalid(code);
         }
     }
@@ -124,23 +187,42 @@ internal sealed class StockDataService : IDisposable
         var startIdx = raw.IndexOf('"');
         var endIdx   = raw.LastIndexOf('"');
         if (startIdx < 0 || endIdx <= startIdx)
+        {
+            Logger.Error($"响应格式错误（无引号）| 股票代码: {code} | 响应: {raw.Substring(0, Math.Min(100, raw.Length))}");
             return Invalid(code);
+        }
 
         var csvPart = raw[(startIdx + 1)..endIdx];
         if (string.IsNullOrWhiteSpace(csvPart))
+        {
+            Logger.Error($"响应内容为空 | 股票代码: {code}");
             return Invalid(code);
+        }
 
         var fields = csvPart.Split(',');
+        Logger.Info($"CSV 字段数量: {fields.Length} | 股票代码: {code}");
+
         if (fields.Length < 32)
+        {
+            Logger.Error($"CSV 字段不足 32 个（实际 {fields.Length}）| 股票代码: {code} | 内容: {csvPart.Substring(0, Math.Min(100, csvPart.Length))}");
             return Invalid(code);
+        }
 
         if (!double.TryParse(fields[2], System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var basePrice) || basePrice <= 0)
+        {
+            Logger.Error($"昨收价格解析失败或 ≤0 | 股票代码: {code} | fields[2]: {fields[2]}");
             return Invalid(code);
+        }
 
         if (!double.TryParse(fields[3], System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var currentPrice))
+        {
+            Logger.Error($"当前价格解析失败 | 股票代码: {code} | fields[3]: {fields[3]}");
             return Invalid(code);
+        }
+
+        Logger.Info($"行情解析成功 | 股票: {fields[0].Trim()} ({code}) | 昨收: {basePrice:F2} | 现价: {currentPrice:F2}");
 
         return new StockSnapshot
         {
@@ -369,6 +451,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
 
     public StockTrayApp()
     {
+        Logger.Info("========== StockTray 启动 ==========");
         _config = _cfgSvc.Load();
 
         // ── 上下文菜单 ────────────────────────
@@ -403,6 +486,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         RefreshSwitchMenu();
 
         // 首次立即拉取
+        Logger.Info("首次拉取行情");
         _ = TickAsync();
     }
 
@@ -419,10 +503,13 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private async Task TickAsync()
     {
         // 调整下次 interval
-        _timer.Interval = IsTradeTime() ? TradeIntervalMs : OffHourIntervalMs;
+        var isTradeTime = IsTradeTime();
+        _timer.Interval = isTradeTime ? TradeIntervalMs : OffHourIntervalMs;
+        Logger.Info($"定时器 Tick | 交易时间: {isTradeTime} | 下次间隔: {_timer.Interval}ms");
 
         if (string.IsNullOrWhiteSpace(_config.CurrentStock))
         {
+            Logger.Warn("当前股票代码为空，跳过拉取");
             UpdateTrayIcon(null);
             return;
         }
@@ -436,10 +523,16 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
             var tradeDate = GetCurrentTradeDate();
             if (_priceHistory.Count == 0 || !IsSameTradingDay(tradeDate))
             {
+                Logger.Info($"交易日切换或首次加载 | 旧日期: {_lastTradeDate} | 新日期: {tradeDate} | 清空历史价格");
                 _priceHistory.Clear();
                 _lastTradeDate = tradeDate;
             }
             _priceHistory.Add(snap.CurrentPrice);
+            Logger.Info($"价格历史更新 | 总点数: {_priceHistory.Count} | 最新价: {snap.CurrentPrice:F2}");
+        }
+        else
+        {
+            Logger.Warn($"行情快照无效，跳过价格历史更新 | 股票代码: {_config.CurrentStock}");
         }
 
         UpdateTrayIcon(snap.IsValid ? snap : null);
@@ -508,7 +601,13 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
         if (dlg.ShowDialog() != DialogResult.OK) return;
 
         var code = dlg.StockCode.Trim().ToLower();
-        if (string.IsNullOrEmpty(code)) return;
+        if (string.IsNullOrEmpty(code))
+        {
+            Logger.Warn("用户输入股票代码为空");
+            return;
+        }
+
+        Logger.Info($"用户添加股票 | 股票代码: {code}");
 
         if (!_config.Stocks.Contains(code))
             _config.Stocks.Add(code);
@@ -542,6 +641,9 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private void SwitchStock(string code)
     {
         if (_config.CurrentStock == code) return;
+
+        Logger.Info($"用户切换股票 | 旧代码: {_config.CurrentStock} | 新代码: {code}");
+
         _config.CurrentStock = code;
         _cfgSvc.Save(_config);
 
@@ -555,6 +657,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     // ── 退出 ───────────────────────────────────
     private void ExitApp()
     {
+        Logger.Info("用户请求退出程序");
         _timer.Stop();
         _notifyIcon.Visible = false;
         Application.Exit();
@@ -644,11 +747,35 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        // 捕获未处理的 UI 线程异常
+        Application.ThreadException += (_, e) =>
+            Logger.Error("未捕获的 UI 线程异常", e.Exception);
+
+        // 捕获未处理的后台线程异常
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Logger.Error($"未捕获的后台异常（IsTerminating={e.IsTerminating}）",
+                e.ExceptionObject as Exception);
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
 
-        using var app = new StockTrayApp();
-        Application.Run(app);
+        Logger.Info($"StockTray 进程启动 | OS: {Environment.OSVersion} | PID: {Environment.ProcessId}");
+        Logger.Info($"程序目录: {AppContext.BaseDirectory}");
+
+        try
+        {
+            using var app = new StockTrayApp();
+            Application.Run(app);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("程序异常退出", ex);
+            throw;
+        }
+        finally
+        {
+            Logger.Info("========== StockTray 退出 ==========");
+        }
     }
 }
