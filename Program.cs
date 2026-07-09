@@ -265,6 +265,7 @@ internal static class IconRenderer
 {
     private const int IconSize = 32;
     private const int Padding  = 2;
+    private const int YAxisWidth = 4;  // Y 轴宽度（含刻度线）
 
     // 科创板 688xxx / 创业板 30xxxx 涨跌幅限制 20%，其余 10%
     private static double GetLimit(string code)
@@ -313,8 +314,9 @@ internal static class IconRenderer
 
     private static void DrawChart(Graphics g, IReadOnlyList<double> history, StockSnapshot snap)
     {
-        var drawW = IconSize - Padding * 2;   // 可绘区域宽度
-        var drawH = IconSize - Padding * 2;   // 可绘区域高度
+        var drawW = IconSize - Padding * 2 - YAxisWidth;   // 减去 Y 轴宽度
+        var drawH = IconSize - Padding * 2;                // 可绘区域高度
+        var chartLeft = Padding + YAxisWidth;              // 图表起始 X 坐标
 
         var limit  = GetLimit(snap.Code);
         var pBase  = snap.BasePrice;
@@ -322,10 +324,28 @@ internal static class IconRenderer
         var pMin   = pBase * (1.0 - limit);
         var range  = pMax - pMin;
 
-        // 零轴（昨收线）
+        // 零轴（昨收线）Y 坐标
         float zeroY = Padding + (float)(drawH * (1.0 - (pBase - pMin) / range));
+
+        // 绘制 Y 轴（左侧竖线 + 三条刻度线）
+        using (var axisLinePen = new Pen(Color.FromArgb(100, Color.Gray), 1f))
+        {
+            // Y 轴竖线
+            g.DrawLine(axisLinePen, Padding + YAxisWidth - 1, Padding, Padding + YAxisWidth - 1, Padding + drawH);
+
+            // 上涨停刻度（顶部）
+            g.DrawLine(axisLinePen, Padding, Padding, Padding + 2, Padding);
+
+            // 零轴刻度（中心）
+            g.DrawLine(axisLinePen, Padding, zeroY, Padding + 2, zeroY);
+
+            // 跌停刻度（底部）
+            g.DrawLine(axisLinePen, Padding, Padding + drawH, Padding + 2, Padding + drawH);
+        }
+
+        // 零轴参考线（从 Y 轴延伸到图表右侧）
         using var zeroLinePen = new Pen(Color.FromArgb(80, Color.Gray), 0.5f);
-        g.DrawLine(zeroLinePen, Padding, zeroY, Padding + drawW, zeroY);
+        g.DrawLine(zeroLinePen, chartLeft, zeroY, Padding + YAxisWidth + drawW, zeroY);
 
         // 折线颜色
         var lineColor = snap.CurrentPrice >= snap.BasePrice
@@ -336,7 +356,7 @@ internal static class IconRenderer
         {
             // 只有一个点，画一个小点
             using var dot = new SolidBrush(lineColor);
-            float x = Padding + drawW / 2f;
+            float x = chartLeft + drawW / 2f;
             float y = CalcY(history[0], pMin, range, Padding, drawH);
             g.FillEllipse(dot, x - 1.5f, y - 1.5f, 3f, 3f);
             return;
@@ -350,7 +370,7 @@ internal static class IconRenderer
 
         for (int i = 0; i < history.Count; i++)
         {
-            float px = Padding + i * xStep;
+            float px = chartLeft + i * xStep;
             float py = CalcY(history[i], pMin, range, Padding, drawH);
             pts[i] = new PointF(px, py);
         }
@@ -372,7 +392,7 @@ internal static class IconRenderer
 // ─────────────────────────────────────────────
 internal sealed class FloatInfoForm : Form
 {
-    public FloatInfoForm(StockSnapshot snap)
+    public FloatInfoForm(StockSnapshot snap, IReadOnlyList<double> priceHistory)
     {
         FormBorderStyle = FormBorderStyle.None;
         BackColor       = Color.FromArgb(30, 30, 30);
@@ -382,13 +402,14 @@ internal sealed class FloatInfoForm : Form
         ShowInTaskbar   = false;
         AutoSize        = false;
 
-        BuildContent(snap);
+        BuildContent(snap, priceHistory);
         Deactivate += (_, _) => Close();
     }
 
-    private void BuildContent(StockSnapshot snap)
+    private void BuildContent(StockSnapshot snap, IReadOnlyList<double> priceHistory)
     {
         const int PadX = 12, PadY = 10, LineH = 22;
+        const int ChartWidth = 320, ChartHeight = 180;  // 更大的图表尺寸
         int y = PadY;
 
         // 标题行
@@ -415,12 +436,28 @@ internal sealed class FloatInfoForm : Form
             $"当日涨跌幅：{sign}{pctChange:F2}%",
             new Point(PadX, y), priceColor, 9f);
         Controls.Add(lblChange);
-        y += LineH + PadY;
+        y += LineH + 8;
+
+        // 绘制分时图（如果有历史数据）
+        if (priceHistory.Count > 0)
+        {
+            var chartPanel = new PictureBox
+            {
+                Location = new Point(PadX, y),
+                Size = new Size(ChartWidth, ChartHeight),
+                BackColor = Color.FromArgb(20, 20, 20),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var chartBitmap = RenderLargeChart(ChartWidth, ChartHeight, priceHistory, snap);
+            chartPanel.Image = chartBitmap;
+
+            Controls.Add(chartPanel);
+            y += ChartHeight + PadY;
+        }
 
         // 自适应窗口大小
-        var maxW = Controls.Cast<Control>()
-            .Max(c => c.PreferredSize.Width) + PadX * 2;
-        ClientSize = new Size(maxW + 10, y);
+        ClientSize = new Size(ChartWidth + PadX * 2, y);
 
         // 放置在鼠标附近（托盘图标上方）
         var screen = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
@@ -428,6 +465,102 @@ internal sealed class FloatInfoForm : Form
         int formX  = Math.Min(pos.X, screen.Right  - Width  - 4);
         int formY  = Math.Max(screen.Top, pos.Y - Height - 8);
         Location = new Point(formX, formY);
+    }
+
+    private static Bitmap RenderLargeChart(int width, int height, IReadOnlyList<double> history, StockSnapshot snap)
+    {
+        var bmp = new Bitmap(width, height);
+        using var g = Graphics.FromImage(bmp);
+
+        g.Clear(Color.FromArgb(20, 20, 20));
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        const int PadX = 10, PadY = 10;
+        const int YAxisWidth = 8;
+        var drawW = width - PadX * 2 - YAxisWidth;
+        var drawH = height - PadY * 2;
+        var chartLeft = PadX + YAxisWidth;
+
+        var limit = snap.Code.ToLowerInvariant().TrimStart('s', 'h', 'z').StartsWith("688") ||
+                    snap.Code.ToLowerInvariant().TrimStart('s', 'h', 'z').StartsWith("30")
+            ? 0.20 : 0.10;
+
+        var pBase = snap.BasePrice;
+        var pMax = pBase * (1.0 + limit);
+        var pMin = pBase * (1.0 - limit);
+        var range = pMax - pMin;
+
+        // 零轴 Y 坐标
+        float zeroY = PadY + (float)(drawH * (1.0 - (pBase - pMin) / range));
+
+        // 绘制 Y 轴
+        using (var axisLinePen = new Pen(Color.FromArgb(80, Color.Gray), 1f))
+        {
+            // Y 轴竖线
+            g.DrawLine(axisLinePen, PadX + YAxisWidth - 1, PadY, PadX + YAxisWidth - 1, PadY + drawH);
+
+            // 上涨停刻度
+            g.DrawLine(axisLinePen, PadX, PadY, PadX + 6, PadY);
+
+            // 零轴刻度
+            g.DrawLine(axisLinePen, PadX, zeroY, PadX + 6, zeroY);
+
+            // 跌停刻度
+            g.DrawLine(axisLinePen, PadX, PadY + drawH, PadX + 6, PadY + drawH);
+        }
+
+        // 零轴参考线
+        using (var zeroLinePen = new Pen(Color.FromArgb(60, Color.Gray), 1f))
+        {
+            zeroLinePen.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
+            g.DrawLine(zeroLinePen, chartLeft, zeroY, PadX + YAxisWidth + drawW, zeroY);
+        }
+
+        // 绘制价格标签（Y 轴右侧）
+        using var font = new Font("Segoe UI", 7f);
+        using var textBrush = new SolidBrush(Color.FromArgb(150, Color.Gray));
+        g.DrawString($"{pMax:F2}", font, textBrush, chartLeft + 2, PadY - 2);
+        g.DrawString($"{pBase:F2}", font, textBrush, chartLeft + 2, zeroY - 8);
+        g.DrawString($"{pMin:F2}", font, textBrush, chartLeft + 2, PadY + drawH - 12);
+
+        if (history.Count == 0) return bmp;
+
+        // 折线颜色
+        var lineColor = snap.CurrentPrice >= snap.BasePrice
+            ? Color.Red
+            : Color.LimeGreen;
+
+        if (history.Count == 1)
+        {
+            using var dot = new SolidBrush(lineColor);
+            float x = chartLeft + drawW / 2f;
+            float y = CalcY(history[0], pMin, range, PadY, drawH);
+            g.FillEllipse(dot, x - 2f, y - 2f, 4f, 4f);
+            return bmp;
+        }
+
+        // 构建折线点集
+        var pts = new PointF[history.Count];
+        float xStep = (float)drawW / (history.Count - 1);
+
+        for (int i = 0; i < history.Count; i++)
+        {
+            float px = chartLeft + i * xStep;
+            float py = CalcY(history[i], pMin, range, PadY, drawH);
+            pts[i] = new PointF(px, py);
+        }
+
+        using var linePen = new Pen(lineColor, 2f);
+        g.DrawLines(linePen, pts);
+
+        return bmp;
+    }
+
+    private static float CalcY(double price, double pMin, double range, int pad, int drawH)
+    {
+        var ratio = range > 0 ? (price - pMin) / range : 0.5;
+        var clamped = Math.Clamp(ratio, 0.0, 1.0);
+        return pad + (float)(drawH * (1.0 - clamped));
     }
 
     private static Label MakeLabel(string text, Point loc, Color color, float size, bool bold = false)
@@ -555,6 +688,15 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
                 _lastTradeDate = tradeDate;
             }
             _priceHistory.Add(snap.CurrentPrice);
+
+            // 🔥 固定窗口：只保留最近 30 个点
+            const int MaxPoints = 30;
+            if (_priceHistory.Count > MaxPoints)
+            {
+                _priceHistory.RemoveAt(0);
+                Logger.Info($"价格历史超过 {MaxPoints} 点，移除最早数据");
+            }
+
             Logger.Info($"价格历史更新 | 总点数: {_priceHistory.Count} | 最新价: {snap.CurrentPrice:F2}");
         }
         else
@@ -616,7 +758,7 @@ internal sealed class StockTrayApp : ApplicationContext, IDisposable
     private void ShowFloatInfo()
     {
         if (_lastSnap == null || !_lastSnap.IsValid) return;
-        var form = new FloatInfoForm(_lastSnap);
+        var form = new FloatInfoForm(_lastSnap, _priceHistory);
         form.Show();
         form.Activate();
     }
