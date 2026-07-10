@@ -300,13 +300,6 @@ internal static class IconRenderer
     private const int Padding  = 2;
     private const int YAxisWidth = 4;  // Y 轴宽度（含刻度线）
 
-    // 科创板 688xxx / 创业板 30xxxx 涨跌幅限制 20%，其余 10%
-    private static double GetLimit(string code)
-    {
-        var lower = code.ToLowerInvariant().TrimStart('s','h','z');
-        return lower.StartsWith("688") || lower.StartsWith("30") ? 0.20 : 0.10;
-    }
-
     /// <summary>
     /// 根据历史价格列表与最新快照绘制托盘图标。
     /// 调用方负责将返回的 Icon 赋值给 NotifyIcon，
@@ -351,11 +344,20 @@ internal static class IconRenderer
         var drawH = IconSize - Padding * 2;                // 可绘区域高度
         var chartLeft = Padding + YAxisWidth;              // 图表起始 X 坐标
 
-        var limit  = GetLimit(snap.Code);
         var pBase  = snap.BasePrice;
-        var pMax   = pBase * (1.0 + limit);
-        var pMin   = pBase * (1.0 - limit);
-        var range  = pMax - pMin;
+
+        // 动态 Y 轴：基于当前历史价格自动缩放，使小波动清晰可见
+        var dataMax   = history.Max();
+        var dataMin   = history.Min();
+        var dataRange = dataMax - dataMin;
+
+        // buffer：取振幅 20% 与昨收价 0.3% 中的较大值，防止折线贴边
+        var buffer = Math.Max(dataRange * 0.2, pBase * 0.003);
+
+        // 确保昨收线（零轴）始终落在可见区域内
+        var pMax  = Math.Max(dataMax + buffer, pBase + buffer);
+        var pMin  = Math.Min(dataMin - buffer, pBase - buffer);
+        var range = pMax - pMin;
 
         // 零轴（昨收线）Y 坐标
         float zeroY = Padding + (float)(drawH * (1.0 - (pBase - pMin) / range));
@@ -514,13 +516,19 @@ internal sealed class FloatInfoForm : Form
         var drawH = height - PadY * 2;
         var chartLeft = PadX + YAxisWidth;
 
-        var limit = snap.Code.ToLowerInvariant().TrimStart('s', 'h', 'z').StartsWith("688") ||
-                    snap.Code.ToLowerInvariant().TrimStart('s', 'h', 'z').StartsWith("30")
-            ? 0.20 : 0.10;
-
         var pBase = snap.BasePrice;
-        var pMax = pBase * (1.0 + limit);
-        var pMin = pBase * (1.0 - limit);
+
+        // 动态 Y 轴：基于当前历史价格自动缩放，使小波动清晰可见
+        var dataMax   = history.Count > 0 ? history.Max() : pBase;
+        var dataMin   = history.Count > 0 ? history.Min() : pBase;
+        var dataRange = dataMax - dataMin;
+
+        // buffer：取振幅 20% 与昨收价 0.3% 中的较大值，防止折线贴边
+        var buffer = Math.Max(dataRange * 0.2, pBase * 0.003);
+
+        // 确保昨收线（零轴）始终落在可见区域内
+        var pMax = Math.Max(dataMax + buffer, pBase + buffer);
+        var pMin = Math.Min(dataMin - buffer, pBase - buffer);
         var range = pMax - pMin;
 
         // 零轴 Y 坐标
